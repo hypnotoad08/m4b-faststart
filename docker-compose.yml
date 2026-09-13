@@ -1,0 +1,23 @@
+# Reference compose file for a manual/scheduled run.
+#
+# This is a one-shot job, not a service — it processes the library once
+# and exits. Trigger it from the NAS's own task scheduler (or `docker
+# compose run --rm faststart`), do NOT `docker compose up -d` this as a
+# long-running container.
+#
+# Example NAS scheduled task command:
+#   docker compose -f /path/to/docker-compose.yml run --rm faststart
+
+services:
+  faststart:
+    image: ghcr.io/hypnotoad08/m4b-faststart:latest
+    # Uncomment to build locally instead of pulling the published image:
+    # build: .
+    volumes:
+      - /path/to/audiobooks:/audiobooks
+      # Small persistent ledger of processed files (faststart-log.json).
+      # Keep this OUTSIDE the audiobooks directory — it's tool bookkeeping,
+      # not library content.
+      - /path/to/appdata/m4b-faststart:/data
+    # Uncomment to preview what would happen without touching files:
+    # command: ["/audiobooks", "--dry-run"]

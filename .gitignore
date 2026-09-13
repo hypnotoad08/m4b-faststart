@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Never commit audiobook files or test fixtures
+*.m4b
+*.M4B
+
+# Ledger / runtime data if run locally against this repo dir
+faststart-log.json
+*.bak
