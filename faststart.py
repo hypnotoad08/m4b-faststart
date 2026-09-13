@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -269,7 +270,42 @@ def verify(src_probe: dict, dst_path: Path, duration_tolerance: float = 1.0) -> 
         raise VerificationError("output is not faststart after remux")
 
 
-def process_file(path: Path, ledger: Ledger, dry_run: bool = False,
+def overwrite_in_place(target: Path, source: Path, chunk_size: int = 4 * 1024 * 1024) -> None:
+    """
+    Overwrite target's contents with source's, WITHOUT changing target's
+    inode — critical for tools like Audiobookshelf that track library
+    files by inode, not just path. A rename-based swap (os.replace) always
+    creates a new inode at the same path and gets seen as a different file,
+    which is exactly what this avoids.
+
+    Safe write ordering: write all new bytes and fsync BEFORE truncating.
+    A crash after the write but before the truncate leaves harmless old
+    trailing bytes past the new (shorter) EOF — truncate() on most
+    filesystems is a single atomic metadata update, so it either applies
+    fully or not at all. The reverse order (truncate-then-write) is never
+    used here because a crash mid-write would leave target corrupted with
+    no way to recover its original content.
+
+    Trade-off: unlike the old rename-swap, this is not atomic to a
+    concurrent reader — a reader that has the file open across the
+    overwrite could see a torn mix of old and new bytes. See the README
+    for why this is accepted rather than worked around.
+    """
+    new_size = source.stat().st_size
+    with open(target, "r+b") as dst, open(source, "rb") as src:
+        while True:
+            chunk = src.read(chunk_size)
+            if not chunk:
+                break
+            dst.write(chunk)
+        dst.flush()
+        os.fsync(dst.fileno())
+        dst.truncate(new_size)
+        dst.flush()
+        os.fsync(dst.fileno())
+
+
+def process_file(path: Path, ledger: Ledger, work_dir: Path, dry_run: bool = False,
                   keep_temp_on_fail: bool = False) -> str:
     """
     Returns one of: "skipped", "processed", "failed". Never raises —
@@ -277,7 +313,7 @@ def process_file(path: Path, ledger: Ledger, dry_run: bool = False,
     remux/verify/swap) is caught and recorded to the ledger as a failure.
     """
     try:
-        return _process_file_inner(path, ledger, dry_run, keep_temp_on_fail)
+        return _process_file_inner(path, ledger, work_dir, dry_run, keep_temp_on_fail)
     except Exception as e:
         log.error("FAILED: %s (%s)", path, e)
         try:
@@ -288,7 +324,7 @@ def process_file(path: Path, ledger: Ledger, dry_run: bool = False,
         return "failed"
 
 
-def _process_file_inner(path: Path, ledger: Ledger, dry_run: bool,
+def _process_file_inner(path: Path, ledger: Ledger, work_dir: Path, dry_run: bool,
                          keep_temp_on_fail: bool) -> str:
     st = path.stat()
     size, mtime = st.st_size, st.st_mtime
@@ -310,29 +346,40 @@ def _process_file_inner(path: Path, ledger: Ledger, dry_run: bool,
     log.info("PROCESSING: %s", path)
     src_probe = ffprobe_json(path)
 
+    # Both the working remux and the recovery backup live entirely OUTSIDE
+    # the audiobooks folder (in work_dir, typically the same mounted volume
+    # as the ledger) — never in the library tree, even transiently. A
+    # scanner that walks the library mid-run (Audiobookshelf, Plex, etc.)
+    # never sees anything but the real book files. A short hash of the
+    # full path keeps names collision-safe and short even though work_dir
+    # is shared across every book, unlike the old per-folder temp file.
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", path.stem)[:60]
+    path_hash = hashlib.sha256(str(path).encode()).hexdigest()[:12]
+    work_dir.mkdir(parents=True, exist_ok=True)
+
     tmp_fd, tmp_name = tempfile.mkstemp(
-        suffix=".m4b", prefix=path.stem + ".tmp.", dir=str(path.parent)
+        suffix=".m4b", prefix=f"{safe_stem}.{path_hash}.tmp.", dir=str(work_dir)
     )
     os.close(tmp_fd)
     tmp_path = Path(tmp_name)
+
+    backup_path = work_dir / f"{safe_stem}.{path_hash}.bak.m4b"
+    backup_made = False
 
     try:
         run_faststart_remux(path, tmp_path)
         verify(src_probe, tmp_path)
 
-        # Preserve original mtime/permissions where practical, then swap in.
-        shutil.copystat(path, tmp_path, follow_symlinks=True)
-        backup_path = path.with_suffix(path.suffix + ".bak")
-        os.replace(path, backup_path)
-        try:
-            os.replace(tmp_path, path)
-        except Exception:
-            # restore original if the final swap somehow fails
-            os.replace(backup_path, path)
-            raise
-        else:
-            backup_path.unlink(missing_ok=True)
+        # A plain recovery copy, made before touching the original at all.
+        # Not part of the write path below — purely a manual fallback if
+        # something goes wrong mid-overwrite.
+        shutil.copy2(path, backup_path)
+        backup_made = True
 
+        overwrite_in_place(path, tmp_path)
+
+        tmp_path.unlink(missing_ok=True)
+        backup_path.unlink(missing_ok=True)
         new_st = path.stat()
         ledger.record(
             path, "processed", new_st.st_size, new_st.st_mtime,
@@ -347,6 +394,8 @@ def _process_file_inner(path: Path, ledger: Ledger, dry_run: bool,
                 log.error("  kept temp file for inspection: %s", tmp_path)
             else:
                 tmp_path.unlink(missing_ok=True)
+        if backup_made:
+            log.error("  original preserved at: %s", backup_path)
         raise  # logged + recorded to the ledger by process_file()
 
 
@@ -354,9 +403,19 @@ def _process_file_inner(path: Path, ledger: Ledger, dry_run: bool,
 # CLI
 # --------------------------------------------------------------------------
 
+def is_our_temp_file(path: Path) -> bool:
+    """True for our own scratch files (see mkstemp prefix/suffix in
+    _process_file_inner). Working files no longer land in the library
+    folder at all (they live in work_dir), but this filter stays as a
+    cheap defense-in-depth in case one was left behind by an older
+    version of the script, or dropped into the library folder some
+    other way."""
+    return ".tmp." in path.name
+
+
 def find_m4b_files(root: Path):
-    yield from sorted(root.rglob("*.m4b"))
-    yield from sorted(root.rglob("*.M4B"))
+    yield from sorted(p for p in root.rglob("*.m4b") if not is_our_temp_file(p))
+    yield from sorted(p for p in root.rglob("*.M4B") if not is_our_temp_file(p))
 
 
 def main(argv=None) -> int:
@@ -377,6 +436,13 @@ def main(argv=None) -> int:
         "--log", default="/data/faststart-log.json",
         help="Path to the processed-file ledger (JSON). Set to empty string "
              "to disable. Default: /data/faststart-log.json",
+    )
+    parser.add_argument(
+        "--work-dir", default="/data/work",
+        help="Scratch directory for in-progress remuxes and recovery backups. "
+             "Kept OUTSIDE the audiobooks folder on purpose — a library "
+             "scanner (Audiobookshelf, Plex, etc.) walking the tree mid-run "
+             "should never see a working file. Default: /data/work",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Debug logging",
@@ -403,6 +469,26 @@ def main(argv=None) -> int:
     if ledger.log_path:
         log.info("Using ledger: %s", ledger.log_path)
 
+    work_dir = Path(args.work_dir)
+
+    # Clean up any of our own scratch files left behind by a run that was
+    # killed mid-job (container OOM'd, host rebooted, etc). These live in
+    # work_dir, never in the library folder, so this is just tidying our
+    # own scratch space — not a scan of the library.
+    if not args.dry_run and work_dir.is_dir():
+        for stray in work_dir.glob("*.tmp.*.m4b"):
+            log.warning("Removing orphaned temp file from a prior run: %s", stray)
+            stray.unlink(missing_ok=True)
+
+    # Also sweep the library folder itself, in case a leftover from an
+    # older version of this script (which used to work in-place there) is
+    # still sitting around.
+    if not args.dry_run:
+        for pattern in ("*.tmp.*.m4b", "*.tmp.*.M4B"):
+            for stray in root.rglob(pattern):
+                log.warning("Removing orphaned temp file from a prior run: %s", stray)
+                stray.unlink(missing_ok=True)
+
     counts = {"skipped": 0, "processed": 0, "failed": 0}
     files = list(find_m4b_files(root))
     log.info("Found %d .m4b file(s) under %s", len(files), root)
@@ -410,7 +496,8 @@ def main(argv=None) -> int:
     for path in files:
         try:
             result = process_file(
-                path, ledger, dry_run=args.dry_run, keep_temp_on_fail=args.keep_temp_on_fail
+                path, ledger, work_dir, dry_run=args.dry_run,
+                keep_temp_on_fail=args.keep_temp_on_fail,
             )
         except Exception as e:
             log.error("UNEXPECTED ERROR on %s: %s", path, e)

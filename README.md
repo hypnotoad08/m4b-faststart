@@ -34,15 +34,62 @@ For each `*.m4b` file under the mounted directory:
      covers embedded cover art, which shows up as an `attached_pic`
      video stream)
    - confirm the output is actually faststart now
-4. **Replace** — only if verification passes: the original is renamed to
-   `<file>.bak`, the new file takes its place, then the `.bak` is
-   deleted. If the final swap fails for any reason, the original is
-   restored automatically. On any failure the original file is never
-   modified.
+4. **Replace** — only if verification passes: the original file is
+   overwritten **in place** (same inode, contents replaced) rather than
+   deleted-and-replaced. This matters for library managers like
+   Audiobookshelf that track files by inode — a delete-and-recreate
+   (even at the identical path) can get seen as a *new* file, leaving
+   you with a duplicate library item pointing at the same book. See
+   [In-place updates](#in-place-updates-and-why) below for the full
+   reasoning and the one trade-off this involves.
 
 Errors and skips are logged; the run ends with a summary line and a
 non-zero exit code if anything failed, so your scheduler can alert on
 it.
+
+## In-place updates, and why
+
+Early versions of this tool wrote the remuxed output to a temp file and
+swapped it in with a rename (`os.replace`). That's the normal safe
+pattern for atomic file updates — but it has one consequence that
+matters specifically for audiobook library managers: a rename creates a
+**new inode** at that path. Audiobookshelf's scanner tracks library
+files by inode, not just path, so a renamed-in replacement — even with
+byte-identical content at the identical path — can be seen as a
+different file, and the book shows up with a duplicate `Library Files`
+entry pointing at the same folder.
+
+To avoid that, the file's contents are overwritten **in place**: the
+original file is opened and its bytes are replaced, then truncated to
+the new (usually slightly smaller) length — the inode never changes.
+Sequence, in order:
+
+1. Remux to a scratch file in `work_dir` (default `/data/work`, outside
+   the library folder entirely — see below).
+2. Verify the scratch file fully (chapters, streams, duration,
+   faststart).
+3. Copy the *original* to a recovery backup, also in `work_dir`.
+4. Write the new bytes into the original file, `fsync`, **then**
+   truncate to the final length — write-then-truncate, never the
+   reverse, so a crash mid-write leaves harmless trailing old bytes past
+   the new EOF rather than a corrupted file.
+5. Delete the scratch file and the recovery backup.
+
+**Trade-off:** unlike a rename-swap, this is not atomic to a concurrent
+reader. If something has the file open and is actively reading through
+the exact moment it's being overwritten, it could see a torn mix of old
+and new bytes rather than cleanly one version or the other. In practice
+this only matters if a book is being actively streamed at the exact
+moment the job processes that exact file — for a home/NAS setup this is
+a narrow window, and running the job during low-usage hours (e.g. the
+weekly cron examples below) avoids it in practice. If a run fails
+partway, the recovery backup in `work_dir` (named
+`<title>.<hash>.bak.m4b`) has the untouched original.
+
+Nothing related to processing — the scratch remux, the recovery backup,
+or anything else — is ever written into the audiobooks folder itself,
+even transiently. A library scanner that happens to walk the tree
+mid-run sees only real book files, never a stray temp file.
 
 ## Processed-file ledger
 
@@ -185,8 +232,11 @@ python3 faststart.py /path/to/audiobooks
 - Processing is one file at a time, sequentially — this is an I/O-bound
   stream copy, not a CPU-bound transcode, so parallelism isn't worth the
   added complexity/risk here.
-- A `.bak` file appearing next to a book during a run is expected and
-  transient; if the container is killed mid-swap, look for `.bak` files
-  and rename them back manually (this is deliberately the ONLY manual
-  recovery step ever needed since the original is never deleted until
-  the replacement is verified and in place).
+- Nothing appears in the audiobooks folder during processing — no temp
+  file, no `.bak`. All scratch/recovery files live in `work_dir`
+  (default `/data/work`) instead; see
+  [In-place updates](#in-place-updates-and-why) above. If a run is
+  killed mid-job, the next run cleans up any leftover scratch file in
+  `work_dir` automatically.
+- The original file's own permissions/ownership are never touched,
+  since its inode is never replaced — only its content.

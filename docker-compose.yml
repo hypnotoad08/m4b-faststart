@@ -15,9 +15,10 @@ services:
     # build: .
     volumes:
       - /path/to/audiobooks:/audiobooks
-      # Small persistent ledger of processed files (faststart-log.json).
-      # Keep this OUTSIDE the audiobooks directory — it's tool bookkeeping,
-      # not library content.
+      # Ledger (faststart-log.json) plus scratch space for in-progress
+      # remuxes and recovery backups (work/ subdir, auto-created). Keep
+      # this OUTSIDE the audiobooks directory — it's tool bookkeeping, not
+      # library content, and library scanners should never see it.
       - /path/to/appdata/m4b-faststart:/data
     # Uncomment to preview what would happen without touching files:
     # command: ["/audiobooks", "--dry-run"]
