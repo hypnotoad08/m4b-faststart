@@ -245,23 +245,30 @@ def verify(src_probe: dict, dst_path: Path, duration_tolerance: float = 1.0) -> 
             f"chapter count mismatch: src={len(src_chapters)} dst={len(dst_chapters)}"
         )
 
-    # Streams — count and codec/type parity (covers audio + attached-pic/cover art)
+    # Streams — count and codec parity, grouped by codec_type rather than by
+    # raw index. run_faststart_remux() only ever maps "0:a" and "0:v?", so
+    # only audio and video (cover art) streams are ours to verify. The mp4
+    # muxer rebuilds a chapter track from -map_metadata 0, which also probes
+    # as a "data"-typed stream and can land at a different index than the
+    # source's own chapter stream did -- e.g. ahead of the cover art instead
+    # of behind it. That shifts positional indices without changing anything
+    # we actually asked to preserve, so a plain zip-by-index falsely flags
+    # those files as broken. Compare each relevant codec_type's streams as a
+    # multiset of codec_names instead; players key off codec_type and
+    # disposition flags (default, attached_pic), not raw stream order, so
+    # order among same-type streams was never something worth enforcing.
     src_streams = src_probe.get("streams", [])
     dst_streams = dst_probe.get("streams", [])
-    if len(src_streams) != len(dst_streams):
-        raise VerificationError(
-            f"stream count mismatch: src={len(src_streams)} dst={len(dst_streams)}"
+    for codec_type in ("audio", "video"):
+        src_group = sorted(
+            s.get("codec_name") for s in src_streams if s.get("codec_type") == codec_type
         )
-    for i, (s, d) in enumerate(zip(src_streams, dst_streams)):
-        if s.get("codec_type") != d.get("codec_type"):
+        dst_group = sorted(
+            d.get("codec_name") for d in dst_streams if d.get("codec_type") == codec_type
+        )
+        if src_group != dst_group:
             raise VerificationError(
-                f"stream {i} codec_type mismatch: src={s.get('codec_type')} "
-                f"dst={d.get('codec_type')}"
-            )
-        if s.get("codec_name") != d.get("codec_name"):
-            raise VerificationError(
-                f"stream {i} codec_name mismatch: src={s.get('codec_name')} "
-                f"dst={d.get('codec_name')}"
+                f"{codec_type} stream mismatch: src={src_group} dst={dst_group}"
             )
 
     # Not faststart-verified? ffmpeg with +faststart on a copy remux should
